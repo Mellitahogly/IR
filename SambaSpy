@@ -1,0 +1,58 @@
+Below are the details of the attack, including the infection chain and the Indicators of Compromise (IOCs), along with the file hashes related to the campaign. These IOCs are critical to identifying and mitigating potential infections.
+Campaign Overview:
+The SambaSpy campaign primarily targets Italian users, delivering malicious content through phishing emails disguised as legitimate communications from real estate companies. The campaign is unique in its ability to ensure only systems with Italian language settings are infected, thus filtering non-relevant targets.
+Infection Chain Breakdown:
+Phishing Email:
+Users receive emails that appear to be from Italian real estate companies, urging them to view an invoice. The phishing emails are written in Italian and originate from German email addresses.
+Redirection to Legitimate Services:
+The victim is redirected to FattureInCloud, a legitimate Italian service used for invoice management. If the target system meets specific criteria (e.g., Italian language settings and supported browsers), they are redirected to a malicious server.
+Malicious Payload Delivery:
+Users are sent to a OneDrive link hosting a malicious PDF file, which leads to the download of a malicious JAR file from MediaFire. This JAR file serves as either a downloader or dropper for the final SambaSpy RAT payload.
+SambaSpy RAT Capabilities:
+The SambaSpy RAT is a feature-rich, Java-based Remote Access Trojan, capable of:
+File manipulation, including upload and download of files.
+Remote desktop control, allowing attackers to control mouse, keyboard, and screen.
+Keystroke logging using JNativeHook.
+Password theft from browsers such as Chrome, Edge, Opera, and Brave.
+Loading additional plugins at runtime for enhanced functionality.
+Indicators of Compromise (IOCs):
+Malicious Files and Associated Hashes:
+Downloader File:
+MD5: 1EC21BD711B491AD47D5C2EF71FF1A10
+SHA1: 73CE7C32AB8CE157B968EB49C4655F9D98926B71
+SHA256: D3EFFD483815A7DE1E1288AB6F4FB673B44A129386EF461466472E22140D47F8
+Malicious PDF File:
+MD5: E6BE6BC2F8E27631A7BFD2E3F06494AA
+SHA1: C7FD7A4D33469F33F1986F20B8D638E77E4D3768
+SHA256: 43F86B6D3300050F8CC0FA83948FBC92FC69AF546F1F215313BAD2E2A040C0FA
+Dropper JAR File:
+MD5: D153006E00884EDF7D48B9FE05D83CB4
+SHA1: BA17CBA48578E8FEBF2591F9157B37652108F89A
+SHA256: 49BBFAC69CA7633414172EC07E996D0DABD3F7811F134EECAFE89ACB8D55B93A
+SambaSpy RAT Payload:
+MD5: 0F3B46D496BBF47E8A2485F794132B48
+SHA1: 28911B5EDD5235DB1119ACD2E09349320D665B88
+SHA256: 9948B75391069F635189C5C5E24C7FAFD88490901B204BCD4075F72ECE5EC265
+Malicious URLs and Domains Used:
+Malicious URLs:
+hxxps://1drv[.]ms/b/s!AnMKZoF8QfODa92x201yr0GDysk?e=ZnX3Rm
+hxxps://moduloj.lamsnajs[.]site/Modulo32.jpg
+Malicious Phishing Domains:
+officediraccoltaanabelacosta[.]net
+belliniepecuniaimmobili[.]com
+immobilibelliniepecunia[.]xyz
+immobilibelliniepecunia[.]online
+immobilibelliniepecunia[.]site
+Mitigation Recommendations:
+Enhanced Email Filtering:
+Block emails from suspicious domains, especially those listed in the IOCs. Phishing emails should be quarantined or blocked based on specific characteristics (e.g., language patterns, domains).
+Traffic Monitoring:
+Actively monitor for traffic to ngrok, OneDrive, and MediaFire, as these services are being abused for malicious purposes in this campaign.
+User Awareness:
+Train users to avoid clicking links in emails from unknown sources, particularly emails that reference invoices or cloud services that they aren’t familiar with.
+Endpoint Protection:
+Ensure that all endpoints are running updated antivirus solutions capable of detecting Java-based malware like SambaSpy. Conduct regular scans for known IOCs.
+Browser Hardening:
+Since SambaSpy targets credentials stored in browsers, ensure password managers and browser settings are configured securely. Monitor for any unauthorized access to browser-stored data.
+Investigate Affected Hosts:
+For any systems where these files or domains have been detected, perform a full investigation to determine the extent of compromise and implement incident response procedures.
